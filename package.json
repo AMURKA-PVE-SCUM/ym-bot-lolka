@@ -1,0 +1,15 @@
+{
+  "name": "ym-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node ym-bot.js",
+    "setup": "node setup.mjs"
+  },
+  "dependencies": {
+    "@dvxch/yandex-music": "^0.2.5",
+    "dotenv": "^16.4.7",
+    "lolka.js": "^0.3.1"
+  }
+}
