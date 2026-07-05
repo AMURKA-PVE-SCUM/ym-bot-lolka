@@ -129,10 +129,6 @@ function controlsRow(state) {
   const stop = new ButtonBuilder().setCustomId('ym_stop').setLabel('⏹').setStyle(ButtonStyle.Danger);
   const queue = new ButtonBuilder().setCustomId('ym_showqueue').setLabel('📋').setStyle(ButtonStyle.Secondary);
   const row = new ActionRowBuilder().addComponents(prev, skip, stop, queue);
-  if (state.currentTrackId) {
-    const like = new ButtonBuilder().setCustomId('ym_like').setLabel('❤️').setStyle(ButtonStyle.Secondary);
-    row.addComponents(like);
-  }
   const row2 = new ActionRowBuilder();
   const shuffleBtn = new ButtonBuilder().setCustomId('ym_shuffle').setLabel(state.shuffle ? '🔀' : '➡️').setStyle(state.shuffle ? ButtonStyle.Success : ButtonStyle.Secondary);
   const loop = new ButtonBuilder().setCustomId('ym_loop').setLabel(state.loop ? '🔁' : '➡️').setStyle(state.loop ? ButtonStyle.Success : ButtonStyle.Secondary);
@@ -154,6 +150,7 @@ async function sendNowPlaying(guildId) {
       state.npMsg = await state.channel.send(payload);
     }
   } catch {
+    if (state.npMsg) state.npMsg.delete().catch(() => {});
     state.npMsg = null;
   }
 }
@@ -183,23 +180,6 @@ async function ensureConnection(guildId, voiceChannel) {
   let conn = connections.get(guildId);
   if (conn && conn.state === 'ready') return { conn, error: null };
   return reconnectVoice(guildId, voiceChannel?.id);
-}
-
-async function ymDownload(trackId, destPath) {
-  let infos;
-  try {
-    infos = await ym.tracksDownloadInfo(trackId, false);
-  } catch {
-    infos = await ym.tracksDownloadInfo(trackId, true);
-  }
-  if (!infos?.length) throw new Error('Нет download-info');
-  infos.sort((a, b) => (b.bitrateInKbps || 0) - (a.bitrateInKbps || 0));
-  const best = infos[0];
-  const ext = extForCodec(best.codec);
-  const fp = destPath + ext;
-  if (existsSync(fp)) return fp;
-  await best.download(fp);
-  return fp;
 }
 
 async function ymDownloadBytes(trackId) {
@@ -358,10 +338,10 @@ async function playTrack(guildId, startIndex) {
     state.failCount = 0;
 
     state.currentTrackId = entry.id;
-    sendNowPlaying(guildId);
+    await sendNowPlaying(guildId);
 
     if (state.source === 'wave' || state.source === 'radio') {
-      sendTrackFeedback(state.guildId || guildId, 'trackStarted', entry.id, 0);
+      await sendTrackFeedback(state.guildId || guildId, 'trackStarted', entry.id, 0);
     }
 
     const cleanup = () => {
@@ -371,7 +351,7 @@ async function playTrack(guildId, startIndex) {
     const onIdle = async () => {
       cleanup();
       if (state.source === 'wave' || state.source === 'radio') {
-        sendTrackFeedback(guildId, 'trackFinished', entry.id, Math.floor((entry.duration || 0) / 1000));
+        await sendTrackFeedback(guildId, 'trackFinished', entry.id, Math.floor((entry.duration || 0) / 1000));
       }
       if (state.shuffle && state.tracks.length > 1) {
         state.index = Math.floor(Math.random() * state.tracks.length);
@@ -724,18 +704,6 @@ lolka.on('messageCreate', async (message) => {
         return;
       }
 
-      if (sub === 'like') {
-        const s = getState(guildId);
-        if (!s.currentTrackId) return tc.send('❌ Сейчас ничего не играет');
-        try {
-          await ym.usersLikesTracksAdd(s.currentTrackId);
-          await tc.send(`❤️ Лайк!`);
-        } catch (e) {
-          await tc.send(`❌ Ошибка: ${e.message}`);
-        }
-        return;
-      }
-
       if (sub === 'dislike') {
         const s = getState(guildId);
         if (!s.currentTrackId) return tc.send('❌ Сейчас ничего не играет');
@@ -762,7 +730,7 @@ lolka.on('messageCreate', async (message) => {
         '`!ym pl` — плейлисты\n' +
         '`!ym top` — чарт\n' +
         '`!ym new` — новинки\n' +
-        '`!ym like` / `!ym dislike`\n' +
+        '`!ym dislike`\n' +
         '`!ym retry` — переподключить YM\n' +
         '`!ym auth` — авторизация в Яндексе (прямо в чате)'
       );
@@ -885,7 +853,7 @@ lolka.on('messageCreate', async (message) => {
 });
 
 lolka.on('interactionCreate', async (interaction) => {
-  if (!interaction.isButton || !interaction.isButton()) return;
+  if (!interaction.isButton()) return;
   const guildId = interaction.guild?.id;
   const state = getState(guildId);
   const tc = interaction.channel;
@@ -901,7 +869,7 @@ lolka.on('interactionCreate', async (interaction) => {
       playTrack(guildId);
     } else if (interaction.customId === 'ym_loop') {
       state.loop = !state.loop;
-      if (state.npMsg) sendNowPlaying(guildId);
+      if (state.npMsg) await sendNowPlaying(guildId);
       interaction.deferUpdate();
     } else if (interaction.customId === 'ym_stop') {
       const conn = connections.get(guildId);
@@ -918,11 +886,6 @@ lolka.on('interactionCreate', async (interaction) => {
       if (state.npMsg) { state.npMsg.delete().catch(() => {}); state.npMsg = null; }
       interaction.deferUpdate();
       tc.send('⏹ Остановлено').catch(() => {});
-    } else if (interaction.customId === 'ym_like') {
-      interaction.deferUpdate();
-      if (state.currentTrackId) {
-        try { await ym.usersLikesTracksAdd(state.currentTrackId); } catch {}
-      }
     } else if (interaction.customId === 'ym_prev') {
       if (state.prevHistory.length > 0) {
         const prevIndex = state.prevHistory.pop();
@@ -943,7 +906,7 @@ lolka.on('interactionCreate', async (interaction) => {
       tc.send(msg).catch(() => {});
     } else if (interaction.customId === 'ym_shuffle') {
       state.shuffle = !state.shuffle;
-      if (state.npMsg) sendNowPlaying(guildId);
+      if (state.npMsg) await sendNowPlaying(guildId);
       interaction.deferUpdate();
     }
   } catch (e) {
