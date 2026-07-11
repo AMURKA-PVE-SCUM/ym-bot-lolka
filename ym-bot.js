@@ -106,9 +106,18 @@ function getState(guildId) {
       shuffle: false,
       queuePage: 0,
       queueMsg: null,
+      trackStartTime: null,
+      progressTimer: null,
     });
   }
   return states.get(guildId);
+}
+
+function clearProgressTimer(state) {
+  if (state.progressTimer) {
+    clearInterval(state.progressTimer);
+    state.progressTimer = null;
+  }
 }
 
 function extForCodec(codec) {
@@ -119,16 +128,24 @@ function extForCodec(codec) {
   return '.mp3';
 }
 
-function nowPlayingEmbed(entry, state) {
+function nowPlayingEmbed(entry, state, elapsedMs) {
   const cover = entry.cover ? `https://${entry.cover}` : null;
   const pos = state.index + 1;
   const total = (state.source === 'wave' || state.source === 'radio') ? '∞' : state.tracks.length;
   const ymUrl = entry.id ? `https://music.yandex.ru/album/0/track/${entry.id}` : null;
 
-  const bar = '▰'.repeat(14);
+  const dur = entry.duration || 1;
+  const pct = Math.min(1, Math.max(0, (elapsedMs || 0) / dur));
+  const barLen = 14;
+  const filled = Math.round(pct * barLen);
+  const bar = '▰'.repeat(filled) + '▱'.repeat(Math.max(0, barLen - filled));
 
   const loopVal = Number(state.loop) || 0;
   const loopIcon = loopVal === 2 ? ' 🔁' : loopVal === 1 ? ' 🔂' : '';
+
+  const elapsedStr = elapsedMs ? formatDuration(elapsedMs) : formatDuration(entry.duration);
+  const totalStr = formatDuration(entry.duration);
+  const timeStr = elapsedMs ? `${elapsedStr}/${totalStr}` : totalStr;
 
   const embed = new EmbedBuilder()
     .setColor(0xFF0000)
@@ -137,10 +154,10 @@ function nowPlayingEmbed(entry, state) {
     .setAuthor({ name: 'Яндекс.Музыка', iconURL: 'https://music.yandex.ru/favicon.ico' })
     .setDescription(
       `**${entry.artist || '—'}**\n` +
-      `${bar} ${formatDuration(entry.duration)}`
+      `${bar} ${timeStr}`
     )
     .addFields(
-      { name: '⏱ Длительность', value: formatDuration(entry.duration), inline: true },
+      { name: '⏱ Прогресс', value: timeStr, inline: true },
       { name: '📻 Источник', value: sourceLabel(state.source), inline: true },
       { name: '📍 Позиция', value: `[${pos}/${total}]${loopIcon}`, inline: true }
     )
@@ -199,7 +216,8 @@ async function sendNowPlaying(guildId) {
   const state = getState(guildId);
   if (!state.channel || !state.tracks[state.index]) return;
   const entry = state.tracks[state.index];
-  const embed = nowPlayingEmbed(entry, state);
+  const elapsedMs = state.trackStartTime ? Date.now() - state.trackStartTime : null;
+  const embed = nowPlayingEmbed(entry, state, elapsedMs);
   const rows = controlsRow(state);
   const payload = { embeds: [embed], components: rows };
   try {
@@ -397,6 +415,9 @@ async function playTrack(guildId, startIndex) {
     conn.removeAllListeners('error');
     conn.play(entry.file);
     state.failCount = 0;
+    clearProgressTimer(state);
+    state.trackStartTime = Date.now();
+    state.progressTimer = setInterval(() => sendNowPlaying(guildId), 5000);
 
     state.currentTrackId = entry.id;
     await sendNowPlaying(guildId);
@@ -414,6 +435,7 @@ async function playTrack(guildId, startIndex) {
       if (state.source === 'wave' || state.source === 'radio') {
         await sendTrackFeedback(guildId, 'trackFinished', entry.id, Math.floor((entry.duration || 0) / 1000));
       }
+      clearProgressTimer(state);
       if (state.loop === 1) {
         // track loop — replay same
       } else if (state.shuffle && state.tracks.length > 1) {
@@ -435,6 +457,7 @@ async function playTrack(guildId, startIndex) {
     };
     const onError = (e) => {
       cleanup();
+      clearProgressTimer(state);
       if (state.loop === 1) {
         // track loop — replay same
       } else if (state.shuffle && state.tracks.length > 1) {
@@ -450,6 +473,7 @@ async function playTrack(guildId, startIndex) {
   } catch (e) {
     console.error('Play error:', e.message);
     state.failCount = (state.failCount || 0) + 1;
+    clearProgressTimer(state);
     if (state.failCount >= 3) {
       await log(`❌ Слишком много ошибок — остановлено: ${e.message}`);
       const c = connections.get(guildId);
@@ -935,6 +959,7 @@ lolka.on('messageCreate', async (message) => {
       }
       conn.removeAllListeners('idle');
       conn.removeAllListeners('error');
+      clearProgressTimer(state);
       if (state.shuffle && state.tracks.length > 1) {
         state.index = Math.floor(Math.random() * state.tracks.length);
       } else {
@@ -951,6 +976,7 @@ lolka.on('messageCreate', async (message) => {
       connections.delete(guildId);
       conn.destroy();
       const state = getState(guildId);
+      clearProgressTimer(state);
       state.tracks = [];
       state.index = 0;
       state.source = null;
@@ -984,6 +1010,7 @@ lolka.on('messageCreate', async (message) => {
       if (state.prevHistory.length === 0) return tc.send('❌ Нет предыдущих треков');
       const conn = connections.get(guildId);
       if (conn) { conn.removeAllListeners('idle'); conn.removeAllListeners('error'); }
+      clearProgressTimer(state);
       state.index = state.prevHistory.pop();
       tc.send('⏮ Назад');
       playTrack(guildId);
@@ -995,7 +1022,8 @@ lolka.on('messageCreate', async (message) => {
       if (!state.tracks.length || state.index >= state.tracks.length)
         return tc.send('📭 Сейчас ничего не играет');
       const t = state.tracks[state.index];
-      const embed = nowPlayingEmbed(t, state);
+      const elapsedMs = state.trackStartTime ? Date.now() - state.trackStartTime : null;
+      const embed = nowPlayingEmbed(t, state, elapsedMs);
       return tc.send({ embeds: [embed] });
     }
 
@@ -1057,6 +1085,7 @@ lolka.on('interactionCreate', async (interaction) => {
       if (!conn) return interaction.reply({ content: '❌ Бот не в голосовом канале', flags: MessageFlags.Ephemeral });
       conn.removeAllListeners('idle');
       conn.removeAllListeners('error');
+      clearProgressTimer(state);
       state.index++;
       interaction.deferUpdate();
       playTrack(guildId);
@@ -1069,6 +1098,7 @@ lolka.on('interactionCreate', async (interaction) => {
       if (!conn) return interaction.reply({ content: '❌ Бот не в голосовом канале', flags: MessageFlags.Ephemeral });
       connections.delete(guildId);
       conn.destroy();
+      clearProgressTimer(state);
       state.tracks = [];
       state.index = 0;
       state.source = null;
@@ -1086,6 +1116,7 @@ lolka.on('interactionCreate', async (interaction) => {
         const prevIndex = state.prevHistory.pop();
         state.index = prevIndex;
       }
+      clearProgressTimer(state);
       interaction.deferUpdate();
       playTrack(guildId);
     } else if (interaction.customId === 'ym_showqueue') {
