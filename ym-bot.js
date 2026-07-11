@@ -426,11 +426,173 @@ const STATION_ALIASES = {
   personal: 'user:onyourwave',
 };
 
+let stationNameMap = null;
+const STATION_COMMANDS = {
+  '__chart__': 'chart',
+  '__new__': 'newreleases',
+};
+
+async function buildStationNameMap() {
+  const map = new Map();
+
+  const add = (key, id, name) => map.set(key.toLowerCase(), { id: id.toLowerCase(), name });
+
+  add('моя волна', 'user:onyourwave', 'Моя волна');
+  add('мояволна', 'user:onyourwave', 'Моя волна');
+  add('my wave', 'user:onyourwave', 'Моя волна');
+  add('mywave', 'user:onyourwave', 'Моя волна');
+  add('волна', 'user:onyourwave', 'Моя волна');
+  add('wave', 'user:onyourwave', 'Моя волна');
+  add('личное', 'user:onyourwave', 'Моя волна');
+  add('персональное', 'user:onyourwave', 'Моя волна');
+  add('чарт', '__chart__', 'Чарт');
+  add('chart', '__chart__', 'Чарт');
+  add('топ', '__chart__', 'Чарт');
+  add('top', '__chart__', 'Чарт');
+  add('новинки', '__new__', 'Новинки');
+  add('new', '__new__', 'Новинки');
+
+  try {
+    const genres = await ym.genres();
+    const walk = (g) => {
+      if (!g.id) return;
+      const ru = g.titles?.ru?.title || g.title;
+      add(g.id, `genre:${g.id}`, ru || g.id);
+      if (ru) add(ru, `genre:${g.id}`, ru);
+      if (g.subGenres) g.subGenres.forEach(walk);
+    };
+    genres.forEach(walk);
+  } catch (e) { console.error('genres error:', e.message); }
+
+  try {
+    const dash = await ym.rotorStationsDashboard();
+    dash?.stations?.forEach(s => {
+      if (!s.station?.id || !s.station.name) return;
+      const id = `${s.station.id.type}:${s.station.id.tag}`;
+      add(s.station.name, id, s.station.name);
+      if (s.station.id.tag) add(s.station.id.tag, id, s.station.name);
+    });
+  } catch (e) { console.error('dashboard error:', e.message); }
+
+  console.log(`🗺 Карта станций: ${map.size} записей`);
+  return map;
+}
+
+async function playStation(guildId, vc, tc, stationId, displayName, source, icon) {
+  const state = getState(guildId);
+  const { conn, error } = await ensureConnection(guildId, vc);
+  if (error) return tc.send(error);
+
+  state.channel = tc;
+  state.source = source || 'radio';
+  state.stationId = stationId;
+  state.batchId = undefined;
+  state.radioSessionId = null;
+  state.tracks = [];
+  state.index = 0;
+  state.from = null;
+  state.totalFetchCount = 0;
+
+  await tc.send(`${icon || '📻'} Загружаю **${displayName}**...`);
+  let refills = 0;
+  while (refills < 4) {
+    const ok = await refillWave(guildId);
+    if (!ok) break;
+    refills++;
+  }
+  if (state.tracks.length === 0) return tc.send('❌ Не удалось получить треки');
+  await tc.send(`${icon || '📻'} **${displayName}** (∞ поток, кэш ${state.tracks.length} треков)`);
+  playTrack(guildId);
+}
+
+async function playSearchFirst(guildId, vc, tc, query) {
+  const result = await ym.search(query, false, 'track', 0, false);
+  const tracks = result?.tracks?.results || [];
+  if (!tracks.length) return null;
+  const track = tracks[0];
+  const state = getState(guildId);
+  const { conn, error } = await ensureConnection(guildId, vc);
+  if (error) return tc.send(error);
+  state.channel = tc;
+  state.source = 'search';
+  state.stationId = null;
+  state.tracks = [];
+  state.index = 0;
+  await tc.send(`⏳ Скачиваю **${track.title}**...`);
+  const ok = await queueTrack(guildId, track, 'search', null);
+  if (!ok) return tc.send('❌ Не удалось скачать трек');
+  await tc.send(`✅ **${track.title}** — ${formatArtist(track.artists)}`);
+  playTrack(guildId);
+  return true;
+}
+
+const PLAY_VERBS = ['включи', 'поставь', 'запусти', 'вруби', 'играй', 'play'];
+
 lolka.on('messageCreate', async (message) => {
   if (message.author?.bot) return;
   const guildId = message.guild?.id;
   const tc = message.channel;
   const vc = message.member?.voice?.channel;
+
+  // ── Natural language commands (без !) ──
+  if (!message.content.startsWith(PREFIX) && ymReady && stationNameMap) {
+    if (MUSIC_CHANNEL_ID && tc.id !== MUSIC_CHANNEL_ID) return;
+    const lower = message.content.toLowerCase().trim();
+    let query = null;
+    for (const verb of PLAY_VERBS) {
+      if (lower.startsWith(verb + ' ') || lower === verb) {
+        query = lower.slice(verb.length).trim();
+        break;
+      }
+    }
+    if (query) {
+      try {
+        const match = stationNameMap.get(query);
+        if (match) {
+          const cmdName = STATION_COMMANDS[match.id];
+          if (cmdName === 'chart') {
+            const chart = await ym.chart();
+            if (!chart?.chart?.tracks?.length) return tc.send('❌ Чарт не доступен');
+            const tracks = chart.chart.tracks.map(t => t.track).filter(Boolean);
+            const state = getState(guildId);
+            const { conn, error } = await ensureConnection(guildId, vc);
+            if (error) return tc.send(error);
+            state.channel = tc; state.source = 'top'; state.stationId = null;
+            state.tracks = []; state.index = 0;
+            await tc.send(`⏳ Загружаю **Чарт**...`);
+            let added = 0;
+            for (const t of tracks.slice(0, 20)) { const ok = await queueTrack(guildId, t, 'top', null); if (ok) added++; }
+            if (!added) return tc.send('❌ Не удалось скачать треки');
+            await tc.send(`🏆 **Чарт** (${added} треков)`);
+            return playTrack(guildId);
+          }
+          if (cmdName === 'newreleases') {
+            const releases = await ym.newReleases();
+            if (!releases?.tracks?.length) return tc.send('❌ Новинки не доступны');
+            const tracks = releases.tracks;
+            const state = getState(guildId);
+            const { conn, error } = await ensureConnection(guildId, vc);
+            if (error) return tc.send(error);
+            state.channel = tc; state.source = 'new'; state.stationId = null;
+            state.tracks = []; state.index = 0;
+            await tc.send(`⏳ Загружаю **Новинки**...`);
+            let added = 0;
+            for (const t of tracks.slice(0, 20)) { const ok = await queueTrack(guildId, t, 'new', null); if (ok) added++; }
+            if (!added) return tc.send('❌ Не удалось скачать треки');
+            await tc.send(`🆕 **Новинки** (${added} треков)`);
+            return playTrack(guildId);
+          }
+          return playStation(guildId, vc, tc, match.id, match.name);
+        }
+        const played = await playSearchFirst(guildId, vc, tc, query);
+        if (played !== null) return;
+        return tc.send(`❌ Не нашёл \`${query}\`. Доступно: рок, поп, моя волна, электроника...`);
+      } catch (e) {
+        return tc.send(`❌ ${e.message}`);
+      }
+    }
+    return;
+  }
 
   if (!message.content.startsWith(PREFIX)) return;
   const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
@@ -523,29 +685,7 @@ lolka.on('messageCreate', async (message) => {
       }
 
       if (sub === 'wave' || sub === 'mywave' || sub === 'мояволна') {
-        const { conn, error } = await ensureConnection(guildId, vc, message);
-        if (error) return tc.send(error);
-
-        state.channel = tc;
-        state.source = 'wave';
-        state.stationId = 'user:onyourwave';
-        state.batchId = undefined;
-        state.radioSessionId = null;
-        state.tracks = [];
-        state.index = 0;
-        state.from = null;
-        state.totalFetchCount = 0;
-
-        await tc.send('🌊 Загружаю **Мою волну**...');
-        let refills = 0;
-        while (refills < 4) {
-          const ok = await refillWave(guildId);
-          if (!ok) break;
-          refills++;
-        }
-        if (state.tracks.length === 0) return tc.send('❌ Не удалось получить треки');
-        await tc.send(`🌊 **Моя волна** (∞ поток, кэш ${state.tracks.length} треков)`);
-        playTrack(guildId);
+        await playStation(guildId, vc, tc, 'user:onyourwave', 'Моя волна', 'wave', '🌊');
         return;
       }
 
@@ -578,29 +718,7 @@ lolka.on('messageCreate', async (message) => {
           }
         }
 
-        const { conn, error } = await ensureConnection(guildId, vc, message);
-        if (error) return tc.send(error);
-
-        state.channel = tc;
-        state.source = 'radio';
-        state.stationId = stationId;
-        state.batchId = undefined;
-        state.radioSessionId = null;
-        state.tracks = [];
-        state.index = 0;
-        state.from = null;
-        state.totalFetchCount = 0;
-
-        await tc.send(`📻 Загружаю **${stationId}**...`);
-        let refills = 0;
-        while (refills < 4) {
-          const ok = await refillWave(guildId);
-          if (!ok) break;
-          refills++;
-        }
-        if (state.tracks.length === 0) return tc.send('❌ Не удалось получить треки');
-        await tc.send(`📻 **${stationId}** (∞ поток, кэш ${state.tracks.length} треков)`);
-        playTrack(guildId);
+        await playStation(guildId, vc, tc, stationId, stationId, 'radio', '📻');
         return;
       }
 
@@ -732,7 +850,10 @@ lolka.on('messageCreate', async (message) => {
         '`!ym new` — новинки\n' +
         '`!ym dislike`\n' +
         '`!ym retry` — переподключить YM\n' +
-        '`!ym auth` — авторизация в Яндексе (прямо в чате)'
+        '`!ym auth` — авторизация в Яндексе (прямо в чате)\n\n' +
+        '💬 Можно просто написать:\n' +
+        '`включи рок` · `включи поп` · `включи моя волна`\n' +
+        '`поставь чарт` · `запусти новинки` · `play <название>`'
       );
     }
 
@@ -822,6 +943,9 @@ lolka.on('messageCreate', async (message) => {
     if (cmd === 'help') {
       return tc.send(
         `**🎵 Яндекс.Музыка бот**\n\n` +
+        `**💬 Голосовые команды (без !):**\n` +
+        `\`включи рок\` \`поставь поп\` \`включи моя волна\`\n` +
+        `\`запусти чарт\` \`play <название трека>\`\n\n` +
         `**Поиск и воспроизведение:**\n` +
         `\`${PREFIX}ym <текст>\` — поиск треков\n` +
         `\`${PREFIX}ym 1-5\` — выбрать из результатов\n` +
@@ -839,9 +963,7 @@ lolka.on('messageCreate', async (message) => {
         `\`${PREFIX}queue\` / кнопка 📋 — очередь\n` +
         `\`${PREFIX}shuffle\` / кнопка 🔀 — перемешать\n` +
         `\`${PREFIX}loop\` / кнопка 🔁 — повтор\n` +
-        `\`${PREFIX}ym like\` — лайкнуть трек\n` +
         `\`${PREFIX}ym dislike\` — дизлайк\n` +
-        `\`${PREFIX}queue\` — очередь\n` +
         `\`${PREFIX}np\` — что играет\n` +
         `\`${PREFIX}help\` — помощь`
       );
@@ -918,6 +1040,7 @@ lolka.once('clientReady', async (c) => {
   console.log(`🎵 YM-бот запущен: ${c.user.tag}`);
   console.log(`📁 Кэш: ${CACHE_DIR}`);
   await initYm();
+  if (ymReady) stationNameMap = await buildStationNameMap();
 
   if (MUSIC_CHANNEL_ID) {
     try {
