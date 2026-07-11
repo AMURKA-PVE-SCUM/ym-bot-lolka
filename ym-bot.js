@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client as LolkaClient, GatewayIntentBits, ActivityType, joinVoiceChannel, Embed, ButtonBuilder, ActionRowBuilder, ButtonStyle, MessageFlags } from 'lolka.js';
+import { Client as LolkaClient, GatewayIntentBits, ActivityType, joinVoiceChannel, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, MessageFlags } from 'lolka.js';
 import { Client as YmClient } from '@dvxch/yandex-music';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
@@ -56,6 +56,18 @@ function formatArtist(artists) {
   return artists.map(a => a.name).join(', ');
 }
 
+function sourceLabel(source) {
+  const labels = {
+    wave: 'Моя волна',
+    radio: 'Станция',
+    search: 'Поиск',
+    playlist: 'Плейлист',
+    top: 'Чарт',
+    new: 'Новинки',
+  };
+  return labels[source] || source || '—';
+}
+
 const lolka = new LolkaClient({
   intents: [
     GatewayIntentBits.Guilds,
@@ -92,6 +104,8 @@ function getState(guildId) {
       totalFetchCount: 0,
       prevHistory: [],
       shuffle: false,
+      queuePage: 0,
+      queueMsg: null,
     });
   }
   return states.get(guildId);
@@ -109,17 +123,31 @@ function nowPlayingEmbed(entry, state) {
   const cover = entry.cover ? `https://${entry.cover}` : null;
   const pos = state.index + 1;
   const total = (state.source === 'wave' || state.source === 'radio') ? '∞' : state.tracks.length;
-  const embed = new Embed({
-    title: '🎵 Сейчас играет',
-    color: 0x8b5cf6,
-    fields: [
-      { name: 'Название', value: entry.title || '—', inline: true },
-      { name: 'Исполнитель', value: entry.artist || '—', inline: true },
-      { name: 'Прогресс', value: `[${pos}/${total}]${state.loop ? ' 🔁' : ''}`, inline: false },
-    ],
-    timestamp: new Date().toISOString(),
-  });
-  if (cover) embed.data.thumbnail = { url: cover };
+  const ymUrl = entry.id ? `https://music.yandex.ru/album/0/track/${entry.id}` : null;
+
+  const bar = '▰'.repeat(14);
+
+  const loopVal = Number(state.loop) || 0;
+  const loopIcon = loopVal === 2 ? ' 🔁' : loopVal === 1 ? ' 🔂' : '';
+
+  const embed = new EmbedBuilder()
+    .setColor(0xFF0000)
+    .setTitle(entry.title || '—')
+    .setURL(ymUrl)
+    .setAuthor({ name: 'Яндекс.Музыка', iconURL: 'https://music.yandex.ru/favicon.ico' })
+    .setDescription(
+      `**${entry.artist || '—'}**\n` +
+      `${bar} ${formatDuration(entry.duration)}`
+    )
+    .addFields(
+      { name: '⏱ Длительность', value: formatDuration(entry.duration), inline: true },
+      { name: '📻 Источник', value: sourceLabel(state.source), inline: true },
+      { name: '📍 Позиция', value: `[${pos}/${total}]${loopIcon}`, inline: true }
+    )
+    .setFooter({ text: '🎧 Управляй кнопками ниже' })
+    .setTimestamp();
+
+  if (cover) embed.setImage(cover);
   return embed;
 }
 
@@ -131,9 +159,40 @@ function controlsRow(state) {
   const row = new ActionRowBuilder().addComponents(prev, skip, stop, queue);
   const row2 = new ActionRowBuilder();
   const shuffleBtn = new ButtonBuilder().setCustomId('ym_shuffle').setLabel(state.shuffle ? '🔀' : '➡️').setStyle(state.shuffle ? ButtonStyle.Success : ButtonStyle.Secondary);
-  const loop = new ButtonBuilder().setCustomId('ym_loop').setLabel(state.loop ? '🔁' : '➡️').setStyle(state.loop ? ButtonStyle.Success : ButtonStyle.Secondary);
+  const loopLabels = ['➡️', '🔂', '🔁'];
+  const loop = new ButtonBuilder().setCustomId('ym_loop').setLabel(loopLabels[state.loop] || '➡️').setStyle(state.loop ? ButtonStyle.Success : ButtonStyle.Secondary);
   row2.addComponents(shuffleBtn, loop);
   return [row, row2];
+}
+
+const PAGE_SIZE = 10;
+
+function queueEmbed(state) {
+  if (!state.tracks.length) return null;
+  const totalPages = Math.ceil(state.tracks.length / PAGE_SIZE);
+  const page = Math.min(Math.max(1, state.queuePage || 1), totalPages);
+  const from = (page - 1) * PAGE_SIZE;
+  const items = state.tracks.slice(from, from + PAGE_SIZE);
+
+  const desc = items.map((t, i) => {
+    const idx = from + i + 1;
+    const now = idx - 1 === state.index ? '🎵' : `\`${idx}.\``;
+    return `${now} **${t.title}** — ${t.artist} (${formatDuration(t.duration)})`;
+  }).join('\n');
+
+  return new EmbedBuilder()
+    .setColor(0xFF0000)
+    .setTitle(`📋 Очередь (${state.tracks.length} треков)`)
+    .setDescription(desc)
+    .setFooter({ text: `Страница ${page}/${totalPages}${state.source ? ` • ${sourceLabel(state.source)}` : ''}` })
+    .setTimestamp();
+}
+
+function queueRows(totalPages, page) {
+  const prev = new ButtonBuilder().setCustomId('ym_queue_prev').setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(page <= 1);
+  const refresh = new ButtonBuilder().setCustomId('ym_showqueue').setLabel('📋').setStyle(ButtonStyle.Secondary);
+  const next = new ButtonBuilder().setCustomId('ym_queue_next').setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages);
+  return [new ActionRowBuilder().addComponents(prev, refresh, next)];
 }
 
 async function sendNowPlaying(guildId) {
@@ -296,8 +355,10 @@ async function playTrack(guildId, startIndex) {
         await log('⏹ Поток закончился');
         return;
       }
-    } else if (state.loop) {
+    } else if (state.loop === 2) {
       state.index = 0;
+    } else if (state.loop === 1) {
+      state.index = Math.max(0, state.index - 1);
     } else {
       const conn = connections.get(guildId);
       if (conn) { conn.removeAllListeners(); conn.destroy(); connections.delete(guildId); }
@@ -353,7 +414,9 @@ async function playTrack(guildId, startIndex) {
       if (state.source === 'wave' || state.source === 'radio') {
         await sendTrackFeedback(guildId, 'trackFinished', entry.id, Math.floor((entry.duration || 0) / 1000));
       }
-      if (state.shuffle && state.tracks.length > 1) {
+      if (state.loop === 1) {
+        // track loop — replay same
+      } else if (state.shuffle && state.tracks.length > 1) {
         state.index = Math.floor(Math.random() * state.tracks.length);
       } else {
         state.index++;
@@ -372,7 +435,9 @@ async function playTrack(guildId, startIndex) {
     };
     const onError = (e) => {
       cleanup();
-      if (state.shuffle && state.tracks.length > 1) {
+      if (state.loop === 1) {
+        // track loop — replay same
+      } else if (state.shuffle && state.tracks.length > 1) {
         state.index = Math.floor(Math.random() * state.tracks.length);
       } else {
         state.index++;
@@ -395,7 +460,9 @@ async function playTrack(guildId, startIndex) {
       state.failCount = 0;
       return;
     }
-    if (state.shuffle && state.tracks.length > 1) {
+    if (state.loop === 1) {
+      // track loop — replay same
+    } else if (state.shuffle && state.tracks.length > 1) {
       state.index = Math.floor(Math.random() * state.tracks.length);
     } else {
       state.index++;
@@ -891,14 +958,17 @@ lolka.on('messageCreate', async (message) => {
       state.batchId = undefined;
       state.radioSessionId = null;
       state.currentTrackId = null;
+      state.queuePage = 0;
+      if (state.queueMsg) { state.queueMsg.delete().catch(() => {}); state.queueMsg = null; }
       await tc.send('⏹ Остановлено');
       return;
     }
 
     if (cmd === 'loop') {
       const state = getState(guildId);
-      state.loop = !state.loop;
-      await tc.send(`🔁 Повтор: **${state.loop ? 'ВКЛ' : 'ВЫКЛ'}**`);
+      state.loop = ((state.loop || 0) + 1) % 3;
+      const labels = ['ВЫКЛ', 'ТРЕК', 'ОЧЕРЕДЬ'];
+      await tc.send(`🔁 Повтор: **${labels[state.loop]}**`);
       return;
     }
 
@@ -932,12 +1002,13 @@ lolka.on('messageCreate', async (message) => {
     if (cmd === 'queue' || cmd === 'q') {
       const state = getState(guildId);
       if (!state.tracks.length) return tc.send('📭 Очередь пуста');
-      const from = state.index;
-      const show = state.tracks.slice(from, from + 20);
-      let msg = `**📋 Очередь (${state.tracks.length}):**\n`;
-      msg += show.map((t, i) => `${i === 0 ? '🎵' : `${from + i + 1}.`} **${t.title}** — ${t.artist}`).join('\n');
-      if (state.tracks.length > from + 20) msg += `\n...и ещё ${state.tracks.length - from - 20}`;
-      return tc.send(msg);
+      const totalPages = Math.ceil(state.tracks.length / PAGE_SIZE);
+      state.queuePage = 1;
+      const embed = queueEmbed(state);
+      if (!embed) return tc.send('📭 Очередь пуста');
+      const rows = queueRows(totalPages, 1);
+      state.queueMsg = await tc.send({ embeds: [embed], components: rows }).catch(() => null);
+      return;
     }
 
     if (cmd === 'help') {
@@ -962,7 +1033,7 @@ lolka.on('messageCreate', async (message) => {
         `\`${PREFIX}stop\` / кнопка ⏹ — остановить\n` +
         `\`${PREFIX}queue\` / кнопка 📋 — очередь\n` +
         `\`${PREFIX}shuffle\` / кнопка 🔀 — перемешать\n` +
-        `\`${PREFIX}loop\` / кнопка 🔁 — повтор\n` +
+        `\`${PREFIX}loop\` / кнопка 🔁 — повтор: выкл/трек/очередь\n` +
         `\`${PREFIX}ym dislike\` — дизлайк\n` +
         `\`${PREFIX}np\` — что играет\n` +
         `\`${PREFIX}help\` — помощь`
@@ -990,7 +1061,7 @@ lolka.on('interactionCreate', async (interaction) => {
       interaction.deferUpdate();
       playTrack(guildId);
     } else if (interaction.customId === 'ym_loop') {
-      state.loop = !state.loop;
+      state.loop = ((state.loop || 0) + 1) % 3;
       if (state.npMsg) await sendNowPlaying(guildId);
       interaction.deferUpdate();
     } else if (interaction.customId === 'ym_stop') {
@@ -1005,7 +1076,9 @@ lolka.on('interactionCreate', async (interaction) => {
       state.batchId = undefined;
       state.radioSessionId = null;
       state.currentTrackId = null;
+      state.queuePage = 0;
       if (state.npMsg) { state.npMsg.delete().catch(() => {}); state.npMsg = null; }
+      if (state.queueMsg) { state.queueMsg.delete().catch(() => {}); state.queueMsg = null; }
       interaction.deferUpdate();
       tc.send('⏹ Остановлено').catch(() => {});
     } else if (interaction.customId === 'ym_prev') {
@@ -1018,14 +1091,35 @@ lolka.on('interactionCreate', async (interaction) => {
     } else if (interaction.customId === 'ym_showqueue') {
       interaction.deferUpdate();
       if (!state.tracks.length) return tc.send('📭 Очередь пуста').catch(() => {});
-      const from = state.index;
-      const show = state.tracks.slice(from, from + 10);
-      let msg = `**📋 Очередь [${from + 1}/${state.tracks.length}]:**\n`;
-      show.forEach((t, i) => {
-        msg += `\`${from + i + 1}.\` ${t.title} — ${t.artist}\n`;
-      });
-      if (state.tracks.length > from + 10) msg += `...и ещё ${state.tracks.length - from - 10} треков`;
-      tc.send(msg).catch(() => {});
+      const totalPages = Math.ceil(state.tracks.length / PAGE_SIZE);
+      state.queuePage = Math.min(Math.max(1, state.queuePage || 1), totalPages);
+      const embed = queueEmbed(state);
+      if (!embed) return tc.send('📭 Очередь пуста').catch(() => {});
+      const rows = queueRows(totalPages, state.queuePage);
+      if (state.queueMsg) {
+        state.queueMsg.edit({ embeds: [embed], components: rows }).catch(() => { state.queueMsg = null; });
+      }
+      if (!state.queueMsg) {
+        state.queueMsg = await tc.send({ embeds: [embed], components: rows }).catch(() => null);
+      }
+    } else if (interaction.customId === 'ym_queue_prev') {
+      interaction.deferUpdate();
+      state.queuePage = Math.max(1, (state.queuePage || 1) - 1);
+      const totalPages = Math.ceil(state.tracks.length / PAGE_SIZE);
+      const embed = queueEmbed(state);
+      const rows = queueRows(totalPages, state.queuePage);
+      if (state.queueMsg) {
+        state.queueMsg.edit({ embeds: [embed], components: rows }).catch(() => { state.queueMsg = null; });
+      }
+    } else if (interaction.customId === 'ym_queue_next') {
+      interaction.deferUpdate();
+      const totalPages = Math.ceil(state.tracks.length / PAGE_SIZE);
+      state.queuePage = Math.min(totalPages, (state.queuePage || 1) + 1);
+      const embed = queueEmbed(state);
+      const rows = queueRows(totalPages, state.queuePage);
+      if (state.queueMsg) {
+        state.queueMsg.edit({ embeds: [embed], components: rows }).catch(() => { state.queueMsg = null; });
+      }
     } else if (interaction.customId === 'ym_shuffle') {
       state.shuffle = !state.shuffle;
       if (state.npMsg) await sendNowPlaying(guildId);
