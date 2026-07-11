@@ -1,4 +1,3 @@
 node_modules/
 .env
-music/_ym/
-music/*.mp3
+music/

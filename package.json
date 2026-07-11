@@ -1,14 +1,14 @@
 {
-  "name": "amurka-bot",
-  "version": "1.0.0",
+  "name": "ym-bot",
+  "version": "2.0.0",
   "type": "module",
+  "description": "Яндекс.Музыка бот для голосовых каналов lolka.app",
   "scripts": {
-    "start": "node index.js"
+    "start": "node ym-bot.js",
+    "setup": "node setup.mjs"
   },
   "dependencies": {
     "@dvxch/yandex-music": "^0.2.5",
-    "@octokit/rest": "^21.1.1",
-    "discord.js": "^14.16.3",
     "dotenv": "^16.4.7",
     "lolka.js": "^0.3.1"
   }
