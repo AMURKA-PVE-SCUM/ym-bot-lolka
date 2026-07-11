@@ -147,7 +147,7 @@ function nowPlayingEmbed(entry, state) {
     .setFooter({ text: '🎧 Управляй кнопками ниже' })
     .setTimestamp();
 
-  if (cover) embed.setImage(cover);
+  if (cover) embed.setThumbnail(cover);
   return embed;
 }
 
