@@ -171,15 +171,17 @@ function nowPlayingEmbed(entry, state, elapsedMs) {
 function controlsRow(state) {
   const prev = new ButtonBuilder().setCustomId('ym_prev').setLabel('⏮').setStyle(ButtonStyle.Secondary);
   const skip = new ButtonBuilder().setCustomId('ym_skip').setLabel('⏭').setStyle(ButtonStyle.Secondary);
+  const row = new ActionRowBuilder().addComponents(prev, skip);
+
   const stop = new ButtonBuilder().setCustomId('ym_stop').setLabel('⏹').setStyle(ButtonStyle.Danger);
   const queue = new ButtonBuilder().setCustomId('ym_showqueue').setLabel('📋').setStyle(ButtonStyle.Secondary);
-  const row = new ActionRowBuilder().addComponents(prev, skip, stop, queue);
-  const row2 = new ActionRowBuilder();
-  const shuffleBtn = new ButtonBuilder().setCustomId('ym_shuffle').setLabel(state.shuffle ? '🔀' : '➡️').setStyle(state.shuffle ? ButtonStyle.Success : ButtonStyle.Secondary);
-  const loopLabels = ['➡️', '🔂', '🔁'];
-  const loop = new ButtonBuilder().setCustomId('ym_loop').setLabel(loopLabels[state.loop] || '➡️').setStyle(state.loop ? ButtonStyle.Success : ButtonStyle.Secondary);
-  row2.addComponents(shuffleBtn, loop);
-  return [row, row2];
+  const row2 = new ActionRowBuilder().addComponents(stop, queue);
+
+  const loopLabels = ['🔁', '🔂', '🔁'];
+  const shuffleBtn = new ButtonBuilder().setCustomId('ym_shuffle').setLabel('🔀').setStyle(state.shuffle ? ButtonStyle.Success : ButtonStyle.Secondary);
+  const loop = new ButtonBuilder().setCustomId('ym_loop').setLabel(loopLabels[state.loop] || '🔁').setStyle(state.loop ? ButtonStyle.Success : ButtonStyle.Secondary);
+  const row3 = new ActionRowBuilder().addComponents(shuffleBtn, loop);
+  return [row, row2, row3];
 }
 
 const PAGE_SIZE = 10;
