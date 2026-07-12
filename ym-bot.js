@@ -696,7 +696,6 @@ lolka.on('messageCreate', async (message) => {
 
   // ── Natural language commands (без !) ──
   if (!message.content.startsWith(PREFIX) && ymReady && stationNameMap) {
-    if (MUSIC_CHANNEL_ID && tc.id !== MUSIC_CHANNEL_ID) return;
     const lower = message.content.toLowerCase().trim();
     let query = null;
     for (const verb of PLAY_VERBS) {
