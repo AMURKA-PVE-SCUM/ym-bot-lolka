@@ -1,8 +1,9 @@
-import 'dotenv/config';
+import { config } from 'dotenv';
 import { Client as LolkaClient, GatewayIntentBits, ActivityType, joinVoiceChannel, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, MessageFlags } from 'lolka.js';
 import { Client as YmClient } from '@dvxch/yandex-music';
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { join } from 'path';
+config({ path: join(import.meta.dirname, '.env') });
 
 const TOKEN = process.env.LOLKA_TOKEN_YM || '';
 const MUSIC_CHANNEL_ID = process.env.MUSIC_CHANNEL_ID || '';
