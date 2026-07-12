@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { Client as LolkaClient, GatewayIntentBits, ActivityType, joinVoiceChannel, EmbedBuilder, ButtonBuilder, ActionRowBuilder, ButtonStyle, MessageFlags } from 'lolka.js';
 import { Client as YmClient } from '@dvxch/yandex-music';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { join } from 'path';
 
 const TOKEN = process.env.LOLKA_TOKEN_YM || '';
@@ -14,6 +14,7 @@ const YM_SESSION_ID2 = process.env.YM_SESSION_ID2 || '';
 
 const CACHE_DIR = join(import.meta.dirname, 'music', '_ym');
 if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+const MAX_CACHED_FILES = 200;
 
 const MAX_QUEUE = 500;
 
@@ -120,12 +121,65 @@ function clearProgressTimer(state) {
   }
 }
 
+function cleanupState(state) {
+  clearProgressTimer(state);
+  state.npMsg?.delete().catch(() => {});
+  state.npMsg = null;
+  state.queueMsg?.delete().catch(() => {});
+  state.queueMsg = null;
+  state.tracks = [];
+  state.index = 0;
+  state.source = null;
+  state.stationId = null;
+  state.batchId = undefined;
+  state.radioSessionId = null;
+  state.currentTrackId = null;
+  state.queuePage = 0;
+  state.searchResults = [];
+  state.prevHistory = [];
+  state.shuffle = false;
+  state.loop = false;
+  state.from = null;
+  state.totalFetchCount = 0;
+  state.trackStartTime = null;
+  state.failCount = 0;
+}
+
+function destroyConnection(guildId) {
+  const conn = connections.get(guildId);
+  if (!conn) return;
+  conn.removeAllListeners('idle');
+  conn.removeAllListeners('error');
+  connections.delete(guildId);
+  if (conn.state !== 'destroyed') conn.destroy();
+  const s = states.get(guildId);
+  if (s) { clearProgressTimer(s); s.npMsg = null; }
+}
+
 function extForCodec(codec) {
   if (codec === 'mp3') return '.mp3';
   if (codec === 'aac') return '.m4a';
   if (codec === 'flac') return '.flac';
   if (codec === 'opus') return '.ogg';
   return '.mp3';
+}
+
+function cleanupCache() {
+  const files = readdirSync(CACHE_DIR);
+  if (files.length <= MAX_CACHED_FILES) return;
+  const used = new Set();
+  for (const s of states.values()) {
+    for (const t of s.tracks) {
+      if (t.file) used.add(t.file);
+    }
+  }
+  files
+    .map(f => join(CACHE_DIR, f))
+    .filter(fp => !used.has(fp))
+    .sort((a, b) => statSync(a).mtimeMs - statSync(b).mtimeMs)
+    .slice(0, files.length - MAX_CACHED_FILES)
+    .forEach(f => { try { unlinkSync(f); } catch {} });
+  console.log(`🧹 Кэш: ${files.length} → ${readdirSync(CACHE_DIR).length} файлов`);
 }
 
 function nowPlayingEmbed(entry, state, elapsedMs) {
@@ -242,7 +296,13 @@ async function reconnectVoice(guildId, channelId) {
   const conn = joinVoiceChannel({
     channelId: vc.id, guildId, adapterCreator: guild.voiceAdapterCreator,
   });
-  conn.once('destroyed', () => { if (connections.get(guildId) === conn) connections.delete(guildId); });
+  conn.once('destroyed', () => {
+    if (connections.get(guildId) === conn) {
+      connections.delete(guildId);
+      const s = states.get(guildId);
+      if (s) { clearProgressTimer(s); s.npMsg = null; }
+    }
+  });
   connections.set(guildId, conn);
   try { await conn.awaitReady(30000); return { conn, error: null }; }
   catch (e) {
@@ -272,6 +332,7 @@ async function ymDownloadBytes(trackId) {
   const fp = join(CACHE_DIR, `${trackId}${ext}`);
   if (existsSync(fp)) return fp;
   await best.download(fp);
+  cleanupCache();
   return fp;
 }
 
@@ -289,7 +350,6 @@ async function queueTrack(guildId, track, source, stationId, batchId) {
       source,
       stationId,
       batchId,
-      ymTrack: track,
     });
     // Trim old tracks when exceeding MAX_QUEUE
     while (state.tracks.length > MAX_QUEUE) {
@@ -352,9 +412,9 @@ async function playTrack(guildId, startIndex) {
   if (startIndex !== undefined) state.index = startIndex;
 
   if (state.tracks.length === 0) {
-    const conn = connections.get(guildId);
-    if (conn) { conn.removeAllListeners(); conn.destroy(); connections.delete(guildId); }
-    if (state.npMsg) { state.npMsg.delete().catch(() => {}); state.npMsg = null; }
+    destroyConnection(guildId);
+    state.npMsg?.delete().catch(() => {});
+    state.npMsg = null;
     await log('📭 Очередь пуста. Используй `!ym` для поиска');
     return;
   }
@@ -363,12 +423,17 @@ async function playTrack(guildId, startIndex) {
     if (state.source === 'wave' || state.source === 'radio') {
       const ok = await refillWave(guildId);
       if (ok) {
-        state.tracks.splice(0, Math.max(0, state.index));
+        const removed = state.tracks.splice(0, Math.max(0, state.index));
+        // Invalidate prevHistory entries for removed tracks
+        if (removed.length > 0) {
+          const removedIds = new Set(removed.map(t => t.id));
+          state.prevHistory = state.prevHistory.filter(id => !removedIds.has(id));
+        }
         state.index = 0;
       } else {
-        const conn = connections.get(guildId);
-        if (conn) { conn.removeAllListeners(); conn.destroy(); connections.delete(guildId); }
-        if (state.npMsg) { state.npMsg.delete().catch(() => {}); state.npMsg = null; }
+        destroyConnection(guildId);
+        state.npMsg?.delete().catch(() => {});
+        state.npMsg = null;
         await log('⏹ Поток закончился');
         return;
       }
@@ -377,9 +442,9 @@ async function playTrack(guildId, startIndex) {
     } else if (state.loop === 1) {
       state.index = Math.max(0, state.index - 1);
     } else {
-      const conn = connections.get(guildId);
-      if (conn) { conn.removeAllListeners(); conn.destroy(); connections.delete(guildId); }
-      if (state.npMsg) { state.npMsg.delete().catch(() => {}); state.npMsg = null; }
+      destroyConnection(guildId);
+      state.npMsg?.delete().catch(() => {});
+      state.npMsg = null;
       await log('⏹ Очередь закончилась');
       return;
     }
@@ -404,9 +469,9 @@ async function playTrack(guildId, startIndex) {
       throw new Error('Файл не найден');
     }
 
-    // Save previous track for back button
-    if (state.index > 0) {
-      state.prevHistory.push(state.index - 1);
+    // Save previous track for back button (store trackId, not index)
+    if (state.index > 0 && state.tracks[state.index - 1]) {
+      state.prevHistory.push(state.tracks[state.index - 1].id);
       if (state.prevHistory.length > 50) state.prevHistory.shift();
     }
 
@@ -422,7 +487,7 @@ async function playTrack(guildId, startIndex) {
     await sendNowPlaying(guildId);
 
     if (state.source === 'wave' || state.source === 'radio') {
-      await sendTrackFeedback(state.guildId || guildId, 'trackStarted', entry.id, 0);
+      await sendTrackFeedback(guildId, 'trackStarted', entry.id, 0);
     }
 
     const cleanup = () => {
@@ -445,7 +510,9 @@ async function playTrack(guildId, startIndex) {
       // Clean up old played tracks periodically
       if (state.source === 'wave' || state.source === 'radio') {
         if (state.index > 50) {
-          state.tracks.splice(0, state.index);
+          const removed = state.tracks.splice(0, state.index);
+          const removedIds = new Set(removed.map(t => t.id));
+          state.prevHistory = state.prevHistory.filter(id => !removedIds.has(id));
           state.index = 0;
         }
         if (state.index >= state.tracks.length - 10) {
@@ -457,6 +524,13 @@ async function playTrack(guildId, startIndex) {
     const onError = (e) => {
       cleanup();
       clearProgressTimer(state);
+      state.failCount = (state.failCount || 0) + 1;
+      if (state.failCount >= 3) {
+        log(`❌ Слишком много ошибок — остановлено: ${e.message}`);
+        destroyConnection(guildId);
+        cleanupState(state);
+        return;
+      }
       if (state.loop === 1) {
         // track loop — replay same
       } else if (state.shuffle && state.tracks.length > 1) {
@@ -475,12 +549,8 @@ async function playTrack(guildId, startIndex) {
     clearProgressTimer(state);
     if (state.failCount >= 3) {
       await log(`❌ Слишком много ошибок — остановлено: ${e.message}`);
-      const c = connections.get(guildId);
-      if (c) { c.removeAllListeners(); c.destroy(); connections.delete(guildId); }
-      if (state.npMsg) { state.npMsg.delete().catch(() => {}); state.npMsg = null; }
-      state.tracks = [];
-      state.index = 0;
-      state.failCount = 0;
+      destroyConnection(guildId);
+      cleanupState(state);
       return;
     }
     if (state.loop === 1) {
@@ -727,6 +797,8 @@ lolka.on('messageCreate', async (message) => {
           await tc.send(`✅ Токен получен! Аккаунт: **${login}**\n⚠ Живёт до перезапуска бота. Для сохранения: \`node setup.mjs\``);
           process.env.YM_TOKEN = token.accessToken;
           if (token.refreshToken) process.env.YM_REFRESH_TOKEN = token.refreshToken;
+          if (test.close) test.close();
+          authClient.close?.();
           await initYm();
         } catch (e) {
           tc.send(`❌ Ошибка: ${e.message}`).catch(() => {});
@@ -808,7 +880,8 @@ lolka.on('messageCreate', async (message) => {
           }
         }
 
-        await playStation(guildId, vc, tc, stationId, stationId, 'radio', '📻');
+        const stName = stationId.includes(':') ? stationId.split(':').pop() : stationId;
+        await playStation(guildId, vc, tc, stationId, stName, 'radio', '📻');
         return;
       }
 
@@ -922,7 +995,7 @@ lolka.on('messageCreate', async (message) => {
           await tc.send(`❌ Ошибка: ${e.message}`);
         }
         const conn2 = connections.get(guildId);
-        if (conn2) conn2.stop();
+        if (conn2) conn2.stop().catch(() => {});
         return;
       }
 
@@ -954,7 +1027,7 @@ lolka.on('messageCreate', async (message) => {
       if (state.currentTrackId && (state.source === 'wave' || state.source === 'radio')) {
         const entry = state.tracks[state.index];
         const played = entry?.duration ? Math.floor(entry.duration / 1000) : 0;
-        sendTrackFeedback(guildId, 'skip', state.currentTrackId, played);
+        await sendTrackFeedback(guildId, 'skip', state.currentTrackId, played);
       }
       conn.removeAllListeners('idle');
       conn.removeAllListeners('error');
@@ -972,19 +1045,9 @@ lolka.on('messageCreate', async (message) => {
     if (cmd === 'stop' || cmd === 'leave') {
       const conn = connections.get(guildId);
       if (!conn) return tc.send('❌ Бот не в голосовом канале');
-      connections.delete(guildId);
-      conn.destroy();
       const state = getState(guildId);
-      clearProgressTimer(state);
-      state.tracks = [];
-      state.index = 0;
-      state.source = null;
-      state.stationId = null;
-      state.batchId = undefined;
-      state.radioSessionId = null;
-      state.currentTrackId = null;
-      state.queuePage = 0;
-      if (state.queueMsg) { state.queueMsg.delete().catch(() => {}); state.queueMsg = null; }
+      destroyConnection(guildId);
+      cleanupState(state);
       await tc.send('⏹ Остановлено');
       return;
     }
@@ -1010,7 +1073,9 @@ lolka.on('messageCreate', async (message) => {
       const conn = connections.get(guildId);
       if (conn) { conn.removeAllListeners('idle'); conn.removeAllListeners('error'); }
       clearProgressTimer(state);
-      state.index = state.prevHistory.pop();
+      const prevId = state.prevHistory.pop();
+      const prevIdx = state.tracks.findIndex(t => t.id === prevId);
+      if (prevIdx >= 0) state.index = prevIdx;
       tc.send('⏮ Назад');
       playTrack(guildId);
       return;
@@ -1085,7 +1150,11 @@ lolka.on('interactionCreate', async (interaction) => {
       conn.removeAllListeners('idle');
       conn.removeAllListeners('error');
       clearProgressTimer(state);
-      state.index++;
+      if (state.shuffle && state.tracks.length > 1) {
+        state.index = Math.floor(Math.random() * state.tracks.length);
+      } else {
+        state.index++;
+      }
       interaction.deferUpdate();
       playTrack(guildId);
     } else if (interaction.customId === 'ym_loop') {
@@ -1095,25 +1164,15 @@ lolka.on('interactionCreate', async (interaction) => {
     } else if (interaction.customId === 'ym_stop') {
       const conn = connections.get(guildId);
       if (!conn) return interaction.reply({ content: '❌ Бот не в голосовом канале', flags: MessageFlags.Ephemeral });
-      connections.delete(guildId);
-      conn.destroy();
-      clearProgressTimer(state);
-      state.tracks = [];
-      state.index = 0;
-      state.source = null;
-      state.stationId = null;
-      state.batchId = undefined;
-      state.radioSessionId = null;
-      state.currentTrackId = null;
-      state.queuePage = 0;
-      if (state.npMsg) { state.npMsg.delete().catch(() => {}); state.npMsg = null; }
-      if (state.queueMsg) { state.queueMsg.delete().catch(() => {}); state.queueMsg = null; }
+      destroyConnection(guildId);
+      cleanupState(state);
       interaction.deferUpdate();
       tc.send('⏹ Остановлено').catch(() => {});
     } else if (interaction.customId === 'ym_prev') {
       if (state.prevHistory.length > 0) {
-        const prevIndex = state.prevHistory.pop();
-        state.index = prevIndex;
+        const prevId = state.prevHistory.pop();
+        const prevIdx = state.tracks.findIndex(t => t.id === prevId);
+        if (prevIdx >= 0) state.index = prevIdx;
       }
       clearProgressTimer(state);
       interaction.deferUpdate();
@@ -1175,13 +1234,18 @@ lolka.once('clientReady', async (c) => {
           const conn = joinVoiceChannel({
             channelId: vc.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator,
           });
-          conn.once('destroyed', () => { if (connections.get(guild.id) === conn) connections.delete(guild.id); });
+          conn.once('destroyed', () => {
+            if (connections.get(guild.id) === conn) {
+              connections.delete(guild.id);
+            }
+          });
           connections.set(guild.id, conn);
           console.log(`🔊 Подключаюсь к ${vc.name}...`);
           try { await conn.awaitReady(30000); console.log('✅ Голос готов'); }
           catch (e) {
             console.error('❌ Голос не готов:', e.message);
-            if (connections.get(guild.id) === conn) connections.delete(guild.id);
+            connections.delete(guild.id);
+            if (conn.state !== 'destroyed') conn.destroy();
           }
         }
       }
@@ -1189,7 +1253,9 @@ lolka.once('clientReady', async (c) => {
   }
 });
 
-process.on('uncaughtException', (e) => { console.error('💥', e.message); });
-process.on('unhandledRejection', (e) => { console.error('💥', e.message); });
+process.on('uncaughtException', (e) => { console.error('💥 Uncaught:', e); });
+process.on('unhandledRejection', (e) => { console.error('💥 Unhandled rejection:', e); });
 
 lolka.login(TOKEN);
+
+lolka.on('guildDelete', (g) => { states.delete(g.id); });
